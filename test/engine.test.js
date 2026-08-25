@@ -467,6 +467,58 @@ test('should match the same slashed path', t => {
   instance.run(req, res)
 })
 
+test('the router normalization options are applied while matching the prefix', t => {
+  t.plan(4)
+
+  const instance = middie(function (err, req) {
+    t.error(err)
+    t.equal(req.url, '//test//sub//')
+  }, {
+    ignoreDuplicateSlashes: true,
+    ignoreTrailingSlash: true,
+    useSemicolonDelimiter: true
+  })
+  const req = {
+    url: '//test//sub//'
+  }
+  const res = {}
+
+  instance.use('/test', function (req, res, next) {
+    t.pass('function called')
+    t.equal(req.url, '/sub')
+    next()
+  })
+
+  instance.run(req, res)
+})
+
+test('a semicolon delimited path is matched against the prefix', t => {
+  t.plan(3)
+
+  const instance = middie(function (err, req) {
+    t.error(err)
+    t.equal(req.url, '/test;foo=bar')
+  }, {
+    useSemicolonDelimiter: true
+  })
+  const req = {
+    url: '/test;foo=bar'
+  }
+  const res = {}
+
+  instance.use('/test', function (req, res, next) {
+    t.equal(req.url, '/')
+    next()
+  })
+
+  instance.use('/no-call', function (req, res, next) {
+    t.fail('should not call this function')
+    next()
+  })
+
+  instance.run(req, res)
+})
+
 test('if the function calls res.end the iterator should stop / 1 (with deprecated finished flag)', t => {
   t.plan(1)
 

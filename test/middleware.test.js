@@ -10,6 +10,7 @@ const fp = require('fastify-plugin')
 const cors = require('cors')
 const helmet = require('helmet')
 const fs = require('node:fs')
+const { pathToRegexp } = require('path-to-regexp')
 
 const middiePlugin = require('../index')
 
@@ -307,6 +308,281 @@ test('middlewares for encoded paths', t => {
       })
     })
   })
+})
+
+// The url a middleware prefix is matched against must be normalized exactly the
+// way the router normalizes the url it routes on, otherwise a crafted url that
+// the router maps onto a guarded prefix skips every middleware of that prefix.
+const API_KEY = 'mock-api-key-123'
+
+function guardMiddie (req, res, next) {
+  if (req.headers['x-api-key'] !== API_KEY) {
+    res.statusCode = 401
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.end(JSON.stringify({ error: 'Unauthorized', where: 'middie /secret guard' }))
+    return
+  }
+  next()
+}
+
+async function buildGuarded (t, routerOptions, hook) {
+  const instance = fastify(routerOptions)
+  t.teardown(() => instance.close())
+
+  await instance.register(middiePlugin, hook ? { hook } : undefined)
+  instance.use('/secret', guardMiddie)
+
+  instance.get('/secret', async () => ({ ok: true, route: '/secret' }))
+  instance.get('/secret/data', async () => ({ ok: true, route: '/secret/data' }))
+
+  return instance
+}
+
+function buildPlain (t, routerOptions) {
+  const instance = fastify(routerOptions)
+  t.teardown(() => instance.close())
+
+  instance.get('/secret', async () => ({ ok: true, route: '/secret' }))
+  instance.get('/secret/data', async () => ({ ok: true, route: '/secret/data' }))
+
+  return instance
+}
+
+async function buildCapturing (t, routerOptions, prefix, routes) {
+  const state = { url: null }
+  const instance = fastify(routerOptions)
+  t.teardown(() => instance.close())
+
+  await instance.register(middiePlugin)
+  instance.use(prefix, function (req, _res, next) {
+    state.url = req.url
+    next()
+  })
+
+  for (const route of routes) {
+    instance.get(route, async () => ({ ok: true }))
+  }
+
+  state.inject = async function (url) {
+    state.url = null
+    await instance.inject({ method: 'GET', url })
+    return state.url
+  }
+
+  return state
+}
+
+// Matching the prefix against the raw url is what let the crafted variants
+// below skip the guard: the very same regexp `use('/secret', fn)` builds does
+// not match them, while the router does route them onto the `/secret` route.
+test('the prefix regexp alone does not match the crafted variants', t => {
+  t.plan(7)
+
+  const regexp = pathToRegexp('/secret', [], { end: false, strict: true })
+
+  t.ok(regexp.exec('/secret'), '/secret matches the raw url')
+  t.ok(regexp.exec('/secret/data'), '/secret/data matches the raw url')
+  t.notOk(regexp.exec('/secret;foo=bar'), '/secret;foo=bar does not match the raw url')
+  t.notOk(regexp.exec('//secret'), '//secret does not match the raw url')
+  t.notOk(regexp.exec('///secret'), '///secret does not match the raw url')
+  t.notOk(regexp.exec('//secret;foo=bar'), '//secret;foo=bar does not match the raw url')
+  t.notOk(regexp.exec('//secret//'), '//secret// does not match the raw url')
+})
+
+test('semicolon delimited paths do not bypass a prefixed middleware', async t => {
+  const guarded = await buildGuarded(t)
+  const plain = buildPlain(t)
+
+  const urls = ['/secret;foo=bar', '/secret;foo=bar?x=1', '/secret;jsessionid=1234']
+
+  for (const url of urls) {
+    const control = await plain.inject({ method: 'GET', url })
+    const secured = await guarded.inject({ method: 'GET', url })
+
+    t.equal(control.statusCode, 200, `${url} is routed to the /secret handler`)
+    t.equal(secured.statusCode, 401, `${url} must be blocked by the middie guard`)
+  }
+
+  const allowed = await guarded.inject({
+    method: 'GET',
+    url: '/secret;foo=bar',
+    headers: { 'x-api-key': API_KEY }
+  })
+  t.equal(allowed.statusCode, 200, 'an authenticated request still goes through')
+})
+
+test('duplicate slashes do not bypass a prefixed middleware', async t => {
+  const routerOptions = { ignoreDuplicateSlashes: true }
+  const guarded = await buildGuarded(t, routerOptions)
+  const plain = buildPlain(t, routerOptions)
+
+  const urls = ['//secret', '//secret/data', '/secret//data', '///secret']
+
+  for (const url of urls) {
+    const control = await plain.inject({ method: 'GET', url })
+    const secured = await guarded.inject({ method: 'GET', url })
+
+    t.equal(control.statusCode, 200, `${url} is routed to a /secret route`)
+    t.equal(secured.statusCode, 401, `${url} must be blocked by the middie guard`)
+  }
+})
+
+test('a trailing slash does not bypass a prefixed middleware', async t => {
+  const routerOptions = { ignoreTrailingSlash: true }
+  const guarded = await buildGuarded(t, routerOptions)
+  const plain = buildPlain(t, routerOptions)
+
+  const urls = ['/secret', '/secret/', '/secret/data/']
+
+  for (const url of urls) {
+    const control = await plain.inject({ method: 'GET', url })
+    const secured = await guarded.inject({ method: 'GET', url })
+
+    t.equal(control.statusCode, 200, `${url} is routed to a /secret route`)
+    t.equal(secured.statusCode, 401, `${url} must be blocked by the middie guard`)
+  }
+})
+
+test('combined normalizations do not bypass a prefixed middleware', async t => {
+  const routerOptions = {
+    ignoreDuplicateSlashes: true,
+    ignoreTrailingSlash: true,
+    useSemicolonDelimiter: true
+  }
+  const guarded = await buildGuarded(t, routerOptions)
+  const plain = buildPlain(t, routerOptions)
+
+  const urls = ['//secret;foo=bar', '//secret//', '//secret;foo=bar/', '//secret//data//']
+
+  for (const url of urls) {
+    const control = await plain.inject({ method: 'GET', url })
+    const secured = await guarded.inject({ method: 'GET', url })
+
+    t.equal(control.statusCode, 200, `${url} is routed to a /secret route`)
+    t.equal(secured.statusCode, 401, `${url} must be blocked by the middie guard`)
+  }
+})
+
+test('crafted paths are blocked whichever hook middie is registered on', async t => {
+  for (const hook of ['onRequest', 'preValidation', 'preHandler']) {
+    const routerOptions = {
+      ignoreDuplicateSlashes: true,
+      ignoreTrailingSlash: true,
+      useSemicolonDelimiter: true
+    }
+    const guarded = await buildGuarded(t, routerOptions, hook)
+
+    for (const url of ['/secret', '//secret', '/secret;foo=bar', '/secret/', '//secret;foo=bar/']) {
+      const res = await guarded.inject({ method: 'GET', url })
+      t.equal(res.statusCode, 401, `hook=${hook} url=${url} must be blocked by the middie guard`)
+    }
+  }
+})
+
+test('req.url stripping with duplicate slashes', async t => {
+  const state = await buildCapturing(t, { ignoreDuplicateSlashes: true }, '/secret', ['/secret/data'])
+
+  t.equal(await state.inject('/secret/data'), '/data', 'normal path should strip to /data')
+  t.equal(await state.inject('//secret/data'), '/data', '//secret/data should strip to /data, not //data')
+  t.equal(await state.inject('/secret//data'), '/data', '/secret//data should strip to /data, not //data')
+})
+
+test('req.url stripping with semicolon delimiter', async t => {
+  const state = await buildCapturing(t, { useSemicolonDelimiter: true }, '/secret', ['/secret', '/secret/data'])
+
+  t.equal(await state.inject('/secret'), '/', 'normal path should strip to /')
+  t.equal(await state.inject('/secret;foo=bar'), '/', '/secret;foo=bar should strip to /, not /;foo=bar')
+  // the semicolon delimiter treats everything after `;` as path parameters, so
+  // /secret;foo=bar/data has the path /secret, not /secret/data
+  t.equal(await state.inject('/secret;foo=bar/data'), '/', '/secret;foo=bar/data has path /secret, strips to /')
+})
+
+test('req.url stripping with trailing slash', async t => {
+  const state = await buildCapturing(t, { ignoreTrailingSlash: true }, '/secret', ['/secret', '/secret/data'])
+
+  t.equal(await state.inject('/secret'), '/', 'normal path should strip to /')
+  t.equal(await state.inject('/secret/'), '/', '/secret/ should strip to /')
+  t.equal(await state.inject('/secret/data/'), '/data', '/secret/data/ should strip to /data')
+})
+
+test('req.url stripping with all normalization options combined', async t => {
+  const state = await buildCapturing(t, {
+    ignoreDuplicateSlashes: true,
+    useSemicolonDelimiter: true,
+    ignoreTrailingSlash: true
+  }, '/secret', ['/secret', '/secret/data'])
+
+  t.equal(await state.inject('//secret;foo=bar/'), '/', '//secret;foo=bar/ should strip to /')
+  t.equal(await state.inject('//secret//data//'), '/data', '//secret//data// should strip to /data')
+})
+
+test('req.url stripping preserves the query string', async t => {
+  const state = await buildCapturing(t, undefined, '/api', ['/api/resource'])
+
+  t.equal(await state.inject('/api/resource?foo=bar'), '/resource?foo=bar', 'single query param preserved')
+  t.equal(await state.inject('/api/resource?foo=bar&baz=qux'), '/resource?foo=bar&baz=qux', 'multiple query params preserved')
+  t.equal(await state.inject('/api/resource?a=1&b=2&c=3'), '/resource?a=1&b=2&c=3', 'many query params preserved')
+})
+
+test('req.url stripping preserves the query string with normalization options', async t => {
+  const state = await buildCapturing(t, {
+    ignoreDuplicateSlashes: true,
+    ignoreTrailingSlash: true
+  }, '/secret', ['/secret/data'])
+
+  t.equal(await state.inject('//secret/data?key=value'), '/data?key=value', '//secret/data?key=value preserves query string')
+  t.equal(await state.inject('/secret//data/?key=value'), '/data?key=value', '/secret//data/?key=value preserves query string')
+})
+
+test('req.url stripping preserves percent-encoded characters', async t => {
+  const state = await buildCapturing(t, undefined, '/prefix', ['/prefix/*'])
+
+  t.equal(await state.inject('/prefix/hello%20world'), '/hello%20world', 'percent-encoded space preserved')
+  t.equal(await state.inject('/prefix/hello%20world%2Ffoo'), '/hello%20world%2Ffoo', 'percent-encoded slash preserved')
+  t.equal(await state.inject('/prefix/path%2Fwith%2Fslashes'), '/path%2Fwith%2Fslashes', 'multiple percent-encoded slashes preserved')
+  t.equal(await state.inject('/prefix/%E4%B8%AD%E6%96%87'), '/%E4%B8%AD%E6%96%87', 'percent-encoded unicode preserved')
+})
+
+test('router option combinations: crafted variants never bypass the middie guard', async t => {
+  const variants = [
+    '/secret',
+    '//secret',
+    '/secret/',
+    '/secret?x=1',
+    '/secret;foo=bar',
+    '/secret;foo=bar?x=1',
+    '//secret;foo=bar',
+    '//secret//',
+    '/%2fsecret',
+    '/%2Fsecret',
+    '/secret%2F'
+  ]
+  const hooks = [undefined, 'onRequest', 'preValidation', 'preHandler']
+
+  for (const hook of hooks) {
+    for (const ignoreDuplicateSlashes of [false, true]) {
+      for (const ignoreTrailingSlash of [false, true]) {
+        for (const useSemicolonDelimiter of [false, true]) {
+          const routerOptions = { ignoreDuplicateSlashes, ignoreTrailingSlash, useSemicolonDelimiter }
+          const label = `hook=${hook || 'default'} dup=${ignoreDuplicateSlashes},trail=${ignoreTrailingSlash},semi=${useSemicolonDelimiter}`
+
+          const guarded = await buildGuarded(t, routerOptions, hook)
+          const plain = buildPlain(t, routerOptions)
+
+          for (const url of variants) {
+            const control = await plain.inject({ method: 'GET', url })
+            const secured = await guarded.inject({ method: 'GET', url })
+
+            t.not(secured.statusCode, 200, `${label} url=${url} should never bypass auth as 200`)
+
+            if (control.statusCode === 200) {
+              t.equal(secured.statusCode, 401, `${label} url=${url} matches a route; middie must block it`)
+            }
+          }
+        }
+      }
+    }
+  }
 })
 
 test('res.end should block middleware execution', t => {

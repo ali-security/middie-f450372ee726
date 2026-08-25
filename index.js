@@ -24,11 +24,28 @@ const supportedHooksWithoutPayload = [
 
 const supportedHooks = [...supportedHooksWithPayload, ...supportedHooksWithoutPayload]
 
+// The url normalization applied by the router must be applied to the url the
+// middlewares are matched against as well, otherwise a crafted url the router
+// normalizes down to a guarded prefix would skip the middlewares of that
+// prefix. Newer Fastify versions nest these under `routerOptions`, while on
+// Fastify 4 they sit directly on `initialConfig`.
+function getRouterOptions (instance) {
+  const initialConfig = (instance && instance.initialConfig) || {}
+  const routerOptions = initialConfig.routerOptions || initialConfig
+
+  return {
+    ignoreDuplicateSlashes: routerOptions.ignoreDuplicateSlashes === true,
+    // The Fastify 4 router splits the path on `;` unless explicitly told not to
+    useSemicolonDelimiter: routerOptions.useSemicolonDelimiter !== false,
+    ignoreTrailingSlash: routerOptions.ignoreTrailingSlash === true
+  }
+}
+
 function fastifyMiddie (fastify, options, next) {
   fastify.decorate('use', use)
   fastify[kMiddlewares] = []
   fastify[kMiddieHasMiddlewares] = false
-  fastify[kMiddie] = Middie(onMiddieEnd)
+  fastify[kMiddie] = Middie(onMiddieEnd, getRouterOptions(fastify))
 
   const hook = options.hook || 'onRequest'
 
@@ -87,7 +104,7 @@ function fastifyMiddie (fastify, options, next) {
   function onRegister (instance) {
     const middlewares = instance[kMiddlewares].slice()
     instance[kMiddlewares] = []
-    instance[kMiddie] = Middie(onMiddieEnd)
+    instance[kMiddie] = Middie(onMiddieEnd, getRouterOptions(instance))
     instance[kMiddieHasMiddlewares] = false
     instance.decorate('use', use)
     for (const middleware of middlewares) {
