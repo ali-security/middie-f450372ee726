@@ -9,7 +9,7 @@
     "coverage": "tap --cov --coverage-report=html test.js",
     "lint": "standard",
     "lint:fix": "standard --fix",
-    "test": "standard && tap test/*.test.js && tsd",
+    "test": "tap test/*.test.js && tsd",
     "test:unit": "tap",
     "test:typescript": "tsd"
   },

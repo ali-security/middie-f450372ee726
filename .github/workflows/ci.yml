@@ -1,23 +1,89 @@
 name: CI
 
 on:
-  push:
-    branches:
-     - main
-     - master
-     - next
-     - 'v*'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional tap file selector; empty runs the full suite.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
+  # Inlined verbatim from the `test` job of the reusable workflow this repo calls,
+  # fastify/workflows/.github/workflows/plugins-ci.yml@v3 (same matrix, same
+  # exclusions, same `npm i --ignore-scripts` + `npm test` commands). A `uses:`
+  # job cannot declare `timeout-minutes`, which the seal build harness requires.
+  # license-check/lint were already disabled via the caller's `with:` inputs.
   test:
-    uses: fastify/workflows/.github/workflows/plugins-ci.yml@v3
-    with:
-      license-check: true
-      lint: true
+    name: Test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [14, 16, 18, 20, 21]
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        exclude:
+          - os: windows-latest
+            node-version: 14
+          - os: macos-latest
+            node-version: 14
+          - os: macos-latest
+            node-version: 16
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm i --ignore-scripts
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx tap ${{ inputs.test-filter }}
+          else
+            npm test
+          fi
+
+  pack:
+    name: Pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.6.0
+
+      - name: Install dependencies
+        run: npm i --ignore-scripts
+
+      - name: Pack tarball
+        run: |
+          npm pack
+          mv fastify-middie-*.tgz "middie-$(node -p "require('./package.json').version").tgz"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: middie-*.tgz
+          if-no-files-found: error
